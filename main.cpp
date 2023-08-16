@@ -12,6 +12,7 @@
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 
+class VideoProducer;
 using Microsoft::WRL::ComPtr;
 
 namespace {
@@ -68,6 +69,172 @@ namespace {
     };
 
 }
+
+
+class VideoProducer
+{
+public:
+    VideoProducer(int width, int height, int slices, int adapterIndex)
+        : m_device{ CreateDeviceOnAdapter(adapterIndex) }
+    {
+        m_device->GetImmediateContext1(m_context.GetAddressOf());
+
+        D3D11_TEXTURE2D_DESC esc = {};
+        esc.Width = width;
+        esc.Height = height;
+        esc.MipLevels = 1;
+        esc.ArraySize = slices;
+        esc.Format = DXGI_FORMAT_NV12;
+        esc.SampleDesc = { 1, 0 };
+        esc.Usage = D3D11_USAGE_DEFAULT;
+        esc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_DECODER;
+        esc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+
+        Check(m_device->CreateTexture2D(&esc, nullptr, m_texture.GetAddressOf()));
+
+        Produce();
+    }
+
+    ~VideoProducer()
+    {
+        m_stopped.store(true, std::memory_order_relaxed);
+        if (m_thread.joinable())
+            m_thread.join();
+    }
+
+    TextureHandle GetTexture()
+    {
+        return { m_texture, &m_contextMutex };
+    }
+
+    void Start()
+    {
+        m_thread = std::thread([this]
+            {
+                while (!m_stopped.load(std::memory_order_relaxed))
+                    Produce();
+            });
+    }
+
+    static ComPtr<ID3D11Texture2D> CreateStagingTexture(const ComPtr<ID3D11DeviceContext1>& context, const ComPtr<ID3D11Texture2D>& src, int slice)
+    {
+        D3D11_TEXTURE2D_DESC desc;
+        src->GetDesc(&desc);
+
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.ArraySize = 1;
+        desc.MiscFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
+        desc.BindFlags = 0;
+
+        ComPtr<ID3D11Device> device;
+        context->GetDevice(device.GetAddressOf());
+
+        ComPtr<ID3D11Texture2D> stagingTex;
+        Check(device->CreateTexture2D(&desc, nullptr, stagingTex.GetAddressOf()));
+
+        context->CopySubresourceRegion1(stagingTex.Get(), 0, 0, 0, 0, src.Get(), slice, nullptr, 0);
+
+        return stagingTex;
+    }
+
+    void MapTexture(int slice, const ComPtr<ID3D11DeviceContext1>& context, const ComPtr<ID3D11Texture2D>& destTexture)
+    {
+
+        std::scoped_lock guard{m_contextMutex};
+        D3D11_TEXTURE2D_DESC desc{};
+        m_texture->GetDesc(&desc);
+
+        auto stagingSrc = CreateStagingTexture(m_context, m_texture, slice % desc.ArraySize);
+
+        D3D11_MAPPED_SUBRESOURCE src{};
+        Check(m_context->Map(stagingSrc.Get(), 0, D3D11_MAP_READ, 0, &src));
+
+        auto stagingDest = CreateStagingTexture(context, destTexture, 0);
+
+        D3D11_MAPPED_SUBRESOURCE dest{};
+        Check(context->Map(stagingDest.Get(), 0, D3D11_MAP_WRITE, 0, &dest));
+
+        for (int j = 0; j < desc.Height * 3/2; ++j)
+        {
+            const unsigned char* pSrc = static_cast<unsigned char*>(src.pData) + j * src.RowPitch;
+            unsigned char* pDest = static_cast<unsigned char*>(dest.pData) + j * dest.RowPitch;
+
+            memcpy(pDest, pSrc, dest.RowPitch);
+        }
+
+        context->Unmap(stagingDest.Get(), 0);
+        m_context->Unmap(stagingSrc.Get(), 0);
+
+        context->CopySubresourceRegion1(destTexture.Get(), 0, 0, 0, 0, stagingDest.Get(), 0, nullptr, 0);
+
+        
+    }
+
+private:
+
+    std::vector<unsigned char> CreateYUV420SampleImage(int chromaRotation, int width, int height)
+    {
+        const size_t rowPitch = width;
+        std::vector<unsigned char> bitmap(rowPitch * height * 3 / 2, 0);
+
+        // Populate the Y plane
+        for (size_t j = 0; j < height; ++j)
+            for (size_t i = 0; i < width; ++i)
+                bitmap[i + j * rowPitch] = static_cast<unsigned char>((j * 255) / height);
+
+
+        // Populate UV plane (downsampled by 2 in both directions)
+        const size_t nLuma = rowPitch * height;
+        auto* UV = bitmap.data() + nLuma;
+
+        const size_t uvWidth = width / 2;
+        const size_t uwHeight = height / 2;
+        for (size_t j = 0; j < uwHeight; ++j) {
+            for (size_t i = 0; i < uvWidth; ++i) {
+                *UV++ = static_cast<unsigned char>(j * 255 / uwHeight + chromaRotation);
+                *UV++ = static_cast<unsigned char>(i * 255 / uvWidth);
+            }
+        }
+        return bitmap;
+    }
+
+    /** Loops over texture array and updates each slice with a new YUV image */
+    void Produce()
+    {
+        D3D11_TEXTURE2D_DESC desc = {};
+        m_texture->GetDesc(&desc);
+
+        for (UINT sliceIdx = 0; sliceIdx < desc.ArraySize; ++sliceIdx)
+        {
+            const auto sliceImage = CreateYUV420SampleImage(m_time + sliceIdx, desc.Width, desc.Height);
+            D3D11_SUBRESOURCE_DATA data{};
+            data.pSysMem = sliceImage.data();
+            data.SysMemPitch = desc.Width;
+
+            D3D11_TEXTURE2D_DESC sliceDesc = desc;
+            sliceDesc.ArraySize = 1;
+            sliceDesc.Usage = D3D11_USAGE_IMMUTABLE;
+
+            ComPtr<ID3D11Texture2D> slice;
+            Check(m_device->CreateTexture2D(&sliceDesc, &data, slice.GetAddressOf()));
+
+            std::scoped_lock guard{m_contextMutex};
+            m_context->CopySubresourceRegion1(m_texture.Get(), sliceIdx, 0, 0, 0, slice.Get(), 0, nullptr, D3D11_COPY_DISCARD);
+        }
+
+        ++m_time;
+    }
+
+    std::thread m_thread;
+    std::atomic_bool m_stopped = false;
+    ComPtr<ID3D11Device1> m_device;
+    ComPtr<ID3D11DeviceContext1> m_context;
+    ComPtr<ID3D11Texture2D> m_texture;
+    std::mutex m_contextMutex;
+
+    int m_time = 0;
+};
 
 class VertexShader
 {
@@ -199,23 +366,27 @@ public:
 
     void Apply(const ComPtr<ID3D11DeviceContext1>& context)
     {
-        std::scoped_lock guard{*m_sharedTexture.m_contextMutex};
+        if (m_producer)
+        {
+            m_producer->MapTexture(m_displayLayer, context, m_displayTexture);
+        }
+        else {
+            std::scoped_lock guard{*m_sharedTexture.m_contextMutex};
 
-        ComPtr<IDXGIResource1> dxgiResource;
-        Check(m_sharedTexture.m_texture.As(&dxgiResource));
+            ComPtr<IDXGIResource1> dxgiResource;
+            Check(m_sharedTexture.m_texture.As(&dxgiResource));
 
-        HANDLE textureHandle{};
-        Check(dxgiResource->GetSharedHandle(&textureHandle));
+            HANDLE textureHandle{};
+            Check(dxgiResource->GetSharedHandle(&textureHandle));
 
-        ComPtr<ID3D11Texture2D> sharedTex;
-        Check(m_device->OpenSharedResource(textureHandle, IID_PPV_ARGS(&sharedTex)));
+            ComPtr<ID3D11Texture2D> sharedTex;
+            Check(m_device->OpenSharedResource(textureHandle, IID_PPV_ARGS(&sharedTex)));
 
-        D3D11_TEXTURE2D_DESC sharedDesc;
-        sharedTex->GetDesc(&sharedDesc);
+            D3D11_TEXTURE2D_DESC sharedDesc;
+            sharedTex->GetDesc(&sharedDesc);
 
-        ComPtr<ID3D11DeviceContext> ctx;
-        m_device->GetImmediateContext(ctx.GetAddressOf());
-        ctx->CopySubresourceRegion(m_displayTexture.Get(), 0, 0, 0, 0, sharedTex.Get(), m_displayLayer % sharedDesc.ArraySize, nullptr);
+            context->CopySubresourceRegion(m_displayTexture.Get(), 0, 0, 0, 0, sharedTex.Get(), m_displayLayer % sharedDesc.ArraySize, nullptr);
+        }
 
         ID3D11ShaderResourceView* textureViews[] = { m_yView.Get(), m_uvView.Get() };
         context->PSSetShaderResources(0, 2, textureViews);
@@ -257,12 +428,18 @@ public:
         Check(m_device->CreateShaderResourceView(m_displayTexture.Get(), &uvDesc, m_uvView.ReleaseAndGetAddressOf()));
     }
 
+    void SetProducer(VideoProducer* producer)
+    {
+        m_producer = producer;
+    }
+
 private:
     ComPtr<ID3D11Device1> m_device;
     ComPtr<ID3D11Texture2D> m_displayTexture;
     ComPtr<ID3D11ShaderResourceView> m_yView;
     ComPtr<ID3D11ShaderResourceView> m_uvView;
     TextureHandle m_sharedTexture;
+    VideoProducer* m_producer = nullptr;
     unsigned int m_displayLayer = 0;
 };
 
@@ -331,6 +508,11 @@ public:
     void SetTexture(const TextureHandle& texture)
     {
         m_texture.SetTexture(texture);
+    }
+
+    void SetProducer(VideoProducer* producer)
+    {
+        m_texture.SetProducer(producer);
     }
 
 private:
@@ -408,115 +590,6 @@ private:
     ComPtr<ID3D11RenderTargetView> m_frameBufferView;
 };
 
-class VideoProducer
-{
-public:
-    VideoProducer(int width, int height, int slices, int adapterIndex)
-        : m_device{ CreateDeviceOnAdapter(adapterIndex) }
-    {
-        m_device->GetImmediateContext1(m_context.GetAddressOf());
-
-        D3D11_TEXTURE2D_DESC esc = {};
-        esc.Width = width;
-        esc.Height = height;
-        esc.MipLevels = 1;
-        esc.ArraySize = slices;
-        esc.Format = DXGI_FORMAT_NV12;
-        esc.SampleDesc = { 1, 0 };
-        esc.Usage = D3D11_USAGE_DEFAULT;
-        esc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_DECODER;
-        esc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
-
-        Check(m_device->CreateTexture2D(&esc, nullptr, m_texture.GetAddressOf()));
-
-        Produce();
-    }
-
-    ~VideoProducer()
-    {
-        m_stopped.store(true, std::memory_order_relaxed);
-        if (m_thread.joinable())
-            m_thread.join();
-    }
-
-    TextureHandle GetTexture()
-    {
-        return { m_texture, &m_contextMutex };
-    }
-
-    void Start()
-    {
-        m_thread = std::thread([this]
-            {
-                while (!m_stopped.load(std::memory_order_relaxed))
-                    Produce();
-            });
-    }
-
-private:
-
-    std::vector<unsigned char> CreateYUV420SampleImage(int chromaRotation, int width, int height)
-    {
-        const size_t rowPitch = width;
-        std::vector<unsigned char> bitmap(rowPitch * height * 3 / 2, 0);
-
-        // Populate the Y plane
-        for (size_t j = 0; j < height; ++j)
-            for (size_t i = 0; i < width; ++i)
-                bitmap[i + j * rowPitch] = static_cast<unsigned char>((j * 255) / height);
-
-
-        // Populate UV plane (downsampled by 2 in both directions)
-        const size_t nLuma = rowPitch * height;
-        auto* UV = bitmap.data() + nLuma;
-
-        const size_t uvWidth = width / 2;
-        const size_t uwHeight = height / 2;
-        for (size_t j = 0; j < uwHeight; ++j) {
-            for (size_t i = 0; i < uvWidth; ++i) {
-                *UV++ = static_cast<unsigned char>(j * 255 / uwHeight + chromaRotation);
-                *UV++ = static_cast<unsigned char>(i * 255 / uvWidth);
-            }
-        }
-        return bitmap;
-    }
-
-    /** Loops over texture array and updates each slice with a new YUV image */
-    void Produce()
-    {
-        D3D11_TEXTURE2D_DESC desc = {};
-        m_texture->GetDesc(&desc);
-
-        for (UINT sliceIdx = 0; sliceIdx < desc.ArraySize; ++sliceIdx)
-        {
-            const auto sliceImage = CreateYUV420SampleImage(m_time + sliceIdx, desc.Width, desc.Height);
-            D3D11_SUBRESOURCE_DATA data{};
-            data.pSysMem = sliceImage.data();
-            data.SysMemPitch = desc.Width;
-
-            D3D11_TEXTURE2D_DESC sliceDesc = desc;
-            sliceDesc.ArraySize = 1;
-            sliceDesc.Usage = D3D11_USAGE_IMMUTABLE;
-
-            ComPtr<ID3D11Texture2D> slice;
-            Check(m_device->CreateTexture2D(&sliceDesc, &data, slice.GetAddressOf()));
-
-            std::scoped_lock guard{m_contextMutex};
-            m_context->CopySubresourceRegion1(m_texture.Get(), sliceIdx, 0, 0, 0, slice.Get(), 0, nullptr, D3D11_COPY_DISCARD);
-        }
-
-        ++m_time;
-    }
-
-    std::thread m_thread;
-    std::atomic_bool m_stopped = false;
-    ComPtr<ID3D11Device1> m_device;
-    ComPtr<ID3D11DeviceContext1> m_context;
-    ComPtr<ID3D11Texture2D> m_texture;
-    std::mutex m_contextMutex;
-
-    int m_time = 0;
-};
 
 struct VideoWindow
 {
@@ -571,6 +644,11 @@ struct VideoWindow
     void SetTexture(const TextureHandle& texture)
     {
         m_quad.SetTexture(texture);
+    }
+
+    void SetProducer(VideoProducer* producer)
+    {
+        m_quad.SetProducer(producer);
     }
 
 private:
@@ -664,6 +742,7 @@ int main()
     WindowClass windowClass{};
     VideoWindow window{ adapterIndex };
 
+    window.SetProducer(&producer);
     window.SetTexture(producer.GetTexture());
     producer.Start();
     window.Show();
