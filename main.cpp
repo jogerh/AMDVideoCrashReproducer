@@ -92,6 +92,7 @@ public:
 
         Check(m_device->CreateTexture2D(&esc, nullptr, m_texture.GetAddressOf()));
 
+        PrintCopyMode();
         Produce();
     }
 
@@ -102,9 +103,11 @@ public:
             m_thread.join();
     }
 
-    TextureHandle GetTexture()
+    D3D11_TEXTURE2D_DESC GetTextureDesc()
     {
-        return { m_texture, &m_contextMutex };
+        D3D11_TEXTURE2D_DESC desc;
+        m_texture->GetDesc(&desc);
+        return desc;
     }
 
     void Start()
@@ -116,7 +119,79 @@ public:
             });
     }
 
-    static ComPtr<ID3D11Texture2D> CreateStagingTexture(const ComPtr<ID3D11DeviceContext1>& context, const ComPtr<ID3D11Texture2D>& src, int slice)
+    void ToggleCopyMode()
+    {
+        if (m_mode == CopyMode::Hw)
+            m_mode = CopyMode::Map;
+        else
+            m_mode = CopyMode::Hw;
+
+        PrintCopyMode();
+    }
+
+    void CopyTexture(unsigned slice, const ComPtr<ID3D11DeviceContext1>& context, const ComPtr<ID3D11Texture2D>& destTexture)
+    {
+        std::scoped_lock guard{m_contextMutex};
+
+        D3D11_TEXTURE2D_DESC desc{};
+        m_texture->GetDesc(&desc);
+
+        if (m_mode == CopyMode::Hw) {
+            ComPtr<IDXGIResource1> dxgiResource;
+            Check(m_texture.As(&dxgiResource));
+
+            HANDLE textureHandle{};
+            Check(dxgiResource->GetSharedHandle(&textureHandle));
+
+            ComPtr<ID3D11Device> device;
+            context->GetDevice(device.GetAddressOf());
+
+            ComPtr<ID3D11Texture2D> sharedTex;
+            Check(device->OpenSharedResource(textureHandle, IID_PPV_ARGS(&sharedTex)));
+
+            context->CopySubresourceRegion(destTexture.Get(), 0, 0, 0, 0, sharedTex.Get(), slice % desc.ArraySize, nullptr);
+        }
+        else {
+            const auto stagingSrc = CreateStagingTexture(D3D11_CPU_ACCESS_READ, m_context, m_texture, slice % desc.ArraySize);
+
+            D3D11_MAPPED_SUBRESOURCE src{};
+            Check(m_context->Map(stagingSrc.Get(), 0, D3D11_MAP_READ, 0, &src));
+
+            const auto stagingDest = CreateStagingTexture(D3D11_CPU_ACCESS_WRITE, context, destTexture, 0);
+
+            D3D11_MAPPED_SUBRESOURCE dest{};
+            Check(context->Map(stagingDest.Get(), 0, D3D11_MAP_WRITE, 0, &dest));
+
+            for (unsigned int j = 0; j < desc.Height * 3 / 2; ++j)
+            {
+                const unsigned char* pSrc = static_cast<unsigned char*>(src.pData) + j * src.RowPitch;
+                unsigned char* pDest = static_cast<unsigned char*>(dest.pData) + j * dest.RowPitch;
+
+                memcpy(pDest, pSrc, dest.RowPitch);
+            }
+
+            context->Unmap(stagingDest.Get(), 0);
+            m_context->Unmap(stagingSrc.Get(), 0);
+
+            context->CopySubresourceRegion1(destTexture.Get(), 0, 0, 0, 0, stagingDest.Get(), 0, nullptr, 0);
+        }
+    }
+
+private:
+
+    enum class CopyMode
+    {
+        Map,
+        Hw
+    };
+
+    void PrintCopyMode()
+    {
+        std::wcerr << "Copy mode is " << (m_mode == CopyMode::Hw ? "hw" : "map")
+            << ". Push any button to toggle between HW and mapped copy mode." << std::endl;
+    }
+
+    static ComPtr<ID3D11Texture2D> CreateStagingTexture(D3D11_CPU_ACCESS_FLAG dir, const ComPtr<ID3D11DeviceContext1>& context, const ComPtr<ID3D11Texture2D>& src, int slice)
     {
         D3D11_TEXTURE2D_DESC desc;
         src->GetDesc(&desc);
@@ -124,7 +199,7 @@ public:
         desc.Usage = D3D11_USAGE_STAGING;
         desc.ArraySize = 1;
         desc.MiscFlags = 0;
-        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ | D3D11_CPU_ACCESS_WRITE;
+        desc.CPUAccessFlags = dir;
         desc.BindFlags = 0;
 
         ComPtr<ID3D11Device> device;
@@ -137,41 +212,6 @@ public:
 
         return stagingTex;
     }
-
-    void MapTexture(int slice, const ComPtr<ID3D11DeviceContext1>& context, const ComPtr<ID3D11Texture2D>& destTexture)
-    {
-
-        std::scoped_lock guard{m_contextMutex};
-        D3D11_TEXTURE2D_DESC desc{};
-        m_texture->GetDesc(&desc);
-
-        auto stagingSrc = CreateStagingTexture(m_context, m_texture, slice % desc.ArraySize);
-
-        D3D11_MAPPED_SUBRESOURCE src{};
-        Check(m_context->Map(stagingSrc.Get(), 0, D3D11_MAP_READ, 0, &src));
-
-        auto stagingDest = CreateStagingTexture(context, destTexture, 0);
-
-        D3D11_MAPPED_SUBRESOURCE dest{};
-        Check(context->Map(stagingDest.Get(), 0, D3D11_MAP_WRITE, 0, &dest));
-
-        for (int j = 0; j < desc.Height * 3/2; ++j)
-        {
-            const unsigned char* pSrc = static_cast<unsigned char*>(src.pData) + j * src.RowPitch;
-            unsigned char* pDest = static_cast<unsigned char*>(dest.pData) + j * dest.RowPitch;
-
-            memcpy(pDest, pSrc, dest.RowPitch);
-        }
-
-        context->Unmap(stagingDest.Get(), 0);
-        m_context->Unmap(stagingSrc.Get(), 0);
-
-        context->CopySubresourceRegion1(destTexture.Get(), 0, 0, 0, 0, stagingDest.Get(), 0, nullptr, 0);
-
-        
-    }
-
-private:
 
     std::vector<unsigned char> CreateYUV420SampleImage(int chromaRotation, int width, int height)
     {
@@ -232,6 +272,7 @@ private:
     ComPtr<ID3D11DeviceContext1> m_context;
     ComPtr<ID3D11Texture2D> m_texture;
     std::mutex m_contextMutex;
+    CopyMode m_mode = CopyMode::Map;
 
     int m_time = 0;
 };
@@ -366,27 +407,7 @@ public:
 
     void Apply(const ComPtr<ID3D11DeviceContext1>& context)
     {
-        if (m_producer)
-        {
-            m_producer->MapTexture(m_displayLayer, context, m_displayTexture);
-        }
-        else {
-            std::scoped_lock guard{*m_sharedTexture.m_contextMutex};
-
-            ComPtr<IDXGIResource1> dxgiResource;
-            Check(m_sharedTexture.m_texture.As(&dxgiResource));
-
-            HANDLE textureHandle{};
-            Check(dxgiResource->GetSharedHandle(&textureHandle));
-
-            ComPtr<ID3D11Texture2D> sharedTex;
-            Check(m_device->OpenSharedResource(textureHandle, IID_PPV_ARGS(&sharedTex)));
-
-            D3D11_TEXTURE2D_DESC sharedDesc;
-            sharedTex->GetDesc(&sharedDesc);
-
-            context->CopySubresourceRegion(m_displayTexture.Get(), 0, 0, 0, 0, sharedTex.Get(), m_displayLayer % sharedDesc.ArraySize, nullptr);
-        }
+        m_producer->CopyTexture(m_displayLayer, context, m_displayTexture);
 
         ID3D11ShaderResourceView* textureViews[] = { m_yView.Get(), m_uvView.Get() };
         context->PSSetShaderResources(0, 2, textureViews);
@@ -394,16 +415,8 @@ public:
         ++m_displayLayer;
     }
 
-    void SetTexture(const TextureHandle& texture)
+    void SetTextureDesc(const D3D11_TEXTURE2D_DESC& sharedDesc)
     {
-        m_sharedTexture = texture;
-
-        // No locking needed since SetTexture must be called before
-        // any threading is introduced.
-
-        D3D11_TEXTURE2D_DESC sharedDesc{};
-        m_sharedTexture.m_texture->GetDesc(&sharedDesc);
-
         D3D11_TEXTURE2D_DESC displayTexDesc = sharedDesc;
         displayTexDesc.ArraySize = 1;
         displayTexDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -431,6 +444,7 @@ public:
     void SetProducer(VideoProducer* producer)
     {
         m_producer = producer;
+        SetTextureDesc(m_producer->GetTextureDesc());
     }
 
 private:
@@ -503,11 +517,6 @@ public:
         m_sampler.Apply(context);
         m_texture.Apply(context);
         m_quad.Apply(context);
-    }
-
-    void SetTexture(const TextureHandle& texture)
-    {
-        m_texture.SetTexture(texture);
     }
 
     void SetProducer(VideoProducer* producer)
@@ -637,18 +646,20 @@ struct VideoWindow
             m_swapChain.Resize(m_device, m_size);
             return 0;
         }
+        if (uMsg == WM_KEYDOWN)
+        {
+            m_producer->ToggleCopyMode();
+            return 0;
+        }
+
 
         return DefWindowProc(hwnd, uMsg, wParam, lParam);
-    }
-
-    void SetTexture(const TextureHandle& texture)
-    {
-        m_quad.SetTexture(texture);
     }
 
     void SetProducer(VideoProducer* producer)
     {
         m_quad.SetProducer(producer);
+        m_producer = producer;
     }
 
 private:
@@ -661,6 +672,7 @@ private:
     SwapChain m_swapChain;
     VideoRenderer m_quad;
     SIZE m_size{};
+    VideoProducer* m_producer = nullptr;
 };
 
 struct WindowClass
@@ -743,7 +755,7 @@ int main()
     VideoWindow window{ adapterIndex };
 
     window.SetProducer(&producer);
-    window.SetTexture(producer.GetTexture());
+
     producer.Start();
     window.Show();
 
