@@ -61,8 +61,30 @@ namespace {
         return shaderCode;
     }
 
-    struct TextureHandle
+    class TextureHandle
     {
+    public:
+        TextureHandle() = default;
+
+        TextureHandle(const ComPtr<ID3D11Texture2D>& texture, std::mutex* contextMutex)
+            : m_texture{ texture }, m_contextMutex{ contextMutex } {}
+
+
+        std::pair<ComPtr<ID3D11Texture2D>, std::mutex*> Open(const ComPtr<ID3D11Device>& device) const
+        {
+            ComPtr<IDXGIResource1> dxgiResource;
+            Check(m_texture.As(&dxgiResource));
+
+            HANDLE textureHandle{};
+            Check(dxgiResource->GetSharedHandle(&textureHandle));
+
+            ComPtr<ID3D11Texture2D> sharedTex;
+            Check(device->OpenSharedResource(textureHandle, IID_PPV_ARGS(&sharedTex)));
+
+            return { sharedTex, m_contextMutex };
+        }
+
+    private:
         ComPtr<ID3D11Texture2D> m_texture;
         std::mutex* m_contextMutex = nullptr;
     };
@@ -199,23 +221,14 @@ public:
 
     void Apply(const ComPtr<ID3D11DeviceContext1>& context)
     {
-        std::scoped_lock guard{*m_sharedTexture.m_contextMutex};
-
-        ComPtr<IDXGIResource1> dxgiResource;
-        Check(m_sharedTexture.m_texture.As(&dxgiResource));
-
-        HANDLE textureHandle{};
-        Check(dxgiResource->GetSharedHandle(&textureHandle));
-
-        ComPtr<ID3D11Texture2D> sharedTex;
-        Check(m_device->OpenSharedResource(textureHandle, IID_PPV_ARGS(&sharedTex)));
+        std::scoped_lock guard{*m_sharedTextureMutex};
 
         D3D11_TEXTURE2D_DESC sharedDesc;
-        sharedTex->GetDesc(&sharedDesc);
+        m_sharedTexture->GetDesc(&sharedDesc);
 
         ComPtr<ID3D11DeviceContext> ctx;
         m_device->GetImmediateContext(ctx.GetAddressOf());
-        ctx->CopySubresourceRegion(m_displayTexture.Get(), 0, 0, 0, 0, sharedTex.Get(), m_displayLayer % sharedDesc.ArraySize, nullptr);
+        ctx->CopySubresourceRegion(m_displayTexture.Get(), 0, 0, 0, 0, m_sharedTexture.Get(), m_displayLayer % sharedDesc.ArraySize, nullptr);
 
         ID3D11ShaderResourceView* textureViews[] = { m_yView.Get(), m_uvView.Get() };
         context->PSSetShaderResources(0, 2, textureViews);
@@ -225,13 +238,13 @@ public:
 
     void SetTexture(const TextureHandle& texture)
     {
-        m_sharedTexture = texture;
+        std::tie(m_sharedTexture, m_sharedTextureMutex) = texture.Open(m_device);
 
         // No locking needed since SetTexture must be called before
         // any threading is introduced.
 
         D3D11_TEXTURE2D_DESC sharedDesc{};
-        m_sharedTexture.m_texture->GetDesc(&sharedDesc);
+        m_sharedTexture->GetDesc(&sharedDesc);
 
         D3D11_TEXTURE2D_DESC displayTexDesc = sharedDesc;
         displayTexDesc.ArraySize = 1;
@@ -262,7 +275,8 @@ private:
     ComPtr<ID3D11Texture2D> m_displayTexture;
     ComPtr<ID3D11ShaderResourceView> m_yView;
     ComPtr<ID3D11ShaderResourceView> m_uvView;
-    TextureHandle m_sharedTexture;
+    ComPtr<ID3D11Texture2D> m_sharedTexture;
+    std::mutex* m_sharedTextureMutex = nullptr;
     unsigned int m_displayLayer = 0;
 };
 
