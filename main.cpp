@@ -60,6 +60,13 @@ namespace {
 
         return shaderCode;
     }
+
+    struct TextureHandle
+    {
+        ComPtr<ID3D11Texture2D> m_texture;
+        std::mutex* m_contextMutex = nullptr;
+    };
+
 }
 
 class VertexShader
@@ -192,11 +199,10 @@ public:
 
     void Apply(const ComPtr<ID3D11DeviceContext1>& context)
     {
-        if (!m_sharedTexture)
-            return;
+        std::scoped_lock guard{*m_sharedTexture.m_contextMutex};
 
         ComPtr<IDXGIResource1> dxgiResource;
-        Check(m_sharedTexture.As(&dxgiResource));
+        Check(m_sharedTexture.m_texture.As(&dxgiResource));
 
         HANDLE textureHandle{};
         Check(dxgiResource->GetSharedHandle(&textureHandle));
@@ -217,12 +223,15 @@ public:
         ++m_displayLayer;
     }
 
-    void SetTexture(const ComPtr<ID3D11Texture2D>& texture)
+    void SetTexture(const TextureHandle& texture)
     {
         m_sharedTexture = texture;
 
-        D3D11_TEXTURE2D_DESC sharedDesc;
-        m_sharedTexture->GetDesc(&sharedDesc);
+        // No locking needed since SetTexture must be called before
+        // any threading is introduced.
+
+        D3D11_TEXTURE2D_DESC sharedDesc{};
+        m_sharedTexture.m_texture->GetDesc(&sharedDesc);
 
         D3D11_TEXTURE2D_DESC displayTexDesc = sharedDesc;
         displayTexDesc.ArraySize = 1;
@@ -253,7 +262,7 @@ private:
     ComPtr<ID3D11Texture2D> m_displayTexture;
     ComPtr<ID3D11ShaderResourceView> m_yView;
     ComPtr<ID3D11ShaderResourceView> m_uvView;
-    ComPtr<ID3D11Texture2D> m_sharedTexture;
+    TextureHandle m_sharedTexture;
     unsigned int m_displayLayer = 0;
 };
 
@@ -319,7 +328,7 @@ public:
         m_quad.Apply(context);
     }
 
-    void SetTexture(const ComPtr<ID3D11Texture2D>& texture)
+    void SetTexture(const TextureHandle& texture)
     {
         m_texture.SetTexture(texture);
     }
@@ -430,9 +439,9 @@ public:
             m_thread.join();
     }
 
-    ComPtr<ID3D11Texture2D> GetTexture()
+    TextureHandle GetTexture()
     {
-        return m_texture;
+        return { m_texture, &m_contextMutex };
     }
 
     void Start()
@@ -492,6 +501,7 @@ private:
             ComPtr<ID3D11Texture2D> slice;
             Check(m_device->CreateTexture2D(&sliceDesc, &data, slice.GetAddressOf()));
 
+            std::scoped_lock guard{m_contextMutex};
             m_context->CopySubresourceRegion1(m_texture.Get(), sliceIdx, 0, 0, 0, slice.Get(), 0, nullptr, D3D11_COPY_DISCARD);
         }
 
@@ -503,6 +513,7 @@ private:
     ComPtr<ID3D11Device1> m_device;
     ComPtr<ID3D11DeviceContext1> m_context;
     ComPtr<ID3D11Texture2D> m_texture;
+    std::mutex m_contextMutex;
 
     int m_time = 0;
 };
@@ -557,7 +568,7 @@ struct VideoWindow
         return DefWindowProc(hwnd, uMsg, wParam, lParam);
     }
 
-    void SetTexture(const ComPtr<ID3D11Texture2D>& texture)
+    void SetTexture(const TextureHandle& texture)
     {
         m_quad.SetTexture(texture);
     }
